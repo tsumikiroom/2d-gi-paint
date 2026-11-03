@@ -63,6 +63,483 @@
   <button id="save" title="Save PNG (S)">Save</button>
 </div>
 <div id="err"></div>
-<script src="main.js"></script>
+<script>
+// 2D GI Paint (WebGL2)。TD 版(../td/glsl)の最小移植: ペイント → seed → JFA → Radiance Cascades → 時間平均 → 表示
+// ペイント層 RGBA16F: A = 1 は surface(RGB = 発光、0 なら壁)、A = 0 は空白
+'use strict';
+
+const NCASC = 6;                 // cascade 数。最上位は画面外まで march する
+const BLK = 1 << NCASC;          // cascade テクスチャは各軸をこの倍数に切り上げる
+const I0 = 2.0;                  // cascade 0 の区間長 px
+const STEPS = 32;                // sphere trace の最大ステップ
+const FALLOFF = 120.0;           // px、0 = なし
+const ACCUM = 0.7;               // 時間平均
+const EXPOSURE = 1.5;
+const INTENSITY = 3.0;
+const UNDO_MAX = 6;
+
+const touch = matchMedia('(pointer: coarse)').matches;
+const params = new URLSearchParams(location.search);
+// シミュレーション解像度の長辺の上限。JFA の座標を half float に入れるので 2048 まで
+const MAX_LONG = Math.min(2048, +params.get('res') || (touch ? 900 : 1400));
+const FIX_MAX = params.has('fix') ? +params.get('fix') : (touch ? 2 : 3);   // bilinear fix を使う段の数
+
+const canvas = document.getElementById('view');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: false });
+if (!gl || !(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'))) {
+  const e = document.getElementById('err');
+  e.textContent = 'This device does not support WebGL2 float render targets.';
+  e.style.display = 'grid';
+  throw new Error('no webgl2 float targets');
+}
+
+// ---------- shaders ----------
+const VS = `#version 300 es
+void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+
+const HEAD = `#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+out vec4 o;
+`;
+
+// ブラシの線分の内側だけ書く(外は discard)。ペイント層を読まないので ping-pong 不要
+const FS_PAINT = HEAD + `
+uniform vec2 uA, uB; uniform float uR, uMode; uniform vec3 uColor;
+float sdSeg(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0); return length(pa - ba * h); }
+void main() {
+  if (sdSeg(gl_FragCoord.xy, uA, uB) >= uR) discard;
+  o = uMode < 0.5 ? vec4(uColor, 1.0) : (uMode < 1.5 ? vec4(0.0, 0.0, 0.0, 1.0) : vec4(0.0));
+}`;
+
+const FS_COPY = HEAD + `
+uniform sampler2D uSrc; uniform vec2 uScale;   // uScale = src / dst(解像度が変わったときの引き伸ばし。補間なし)
+void main() { o = texelFetch(uSrc, ivec2(floor(gl_FragCoord.xy * uScale)), 0); }`;
+
+// surface の画素に自分のピクセル座標(整数)を書く。空白は -1。half float で 2048 まで正確
+const FS_SEED = HEAD + `
+uniform sampler2D uPaint;
+void main() { ivec2 ip = ivec2(gl_FragCoord.xy); o = texelFetch(uPaint, ip, 0).a > 0.5 ? vec4(vec2(ip), 0.0, 1.0) : vec4(-1.0, -1.0, 0.0, 0.0); }`;
+
+const FS_JFA = HEAD + `
+uniform sampler2D uPrev; uniform int uJump;
+void main() {
+  ivec2 res = textureSize(uPrev, 0), ip = ivec2(gl_FragCoord.xy);
+  vec2 best = vec2(-1.0); float bestD = 1e20;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    ivec2 q = ip + ivec2(x, y) * uJump;
+    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, res))) continue;
+    vec2 s = texelFetch(uPrev, q, 0).xy;
+    if (s.x < 0.0) continue;
+    vec2 d = s - vec2(ip); float dd = dot(d, d);
+    if (dd < bestD) { bestD = dd; best = s; }
+  }
+  o = best.x < 0.0 ? vec4(-1.0, -1.0, 0.0, 0.0) : vec4(best, 0.0, 1.0);
+}`;
+
+// Radiance Cascades 1 段(TD の rc.glsl から媒質・表裏バランスを除いたもの)
+const FS_RC = HEAD + `
+uniform sampler2D uScene, uJfa, uUpper;
+uniform vec4 uRC;    // x = N, y = cascade 数, z = I0, w = 最大ステップ
+uniform vec4 uRC2;   // x = 未使用, y = Falloff, z = 1 なら bilinear fix, w = 角度ジッター
+uniform vec2 uRes;   // 画面の解像度(cascade テクスチャは切り上げてある)
+uniform float uFixMax;
+#define TAU 6.28318530718
+float fw(float t) { return uRC2.y > 0.0 ? exp(-t / uRC2.y) : 1.0; }
+float dist(ivec2 ip) { vec2 s = texelFetch(uJfa, ip, 0).xy; return s.x < 0.0 ? 1e5 : distance(vec2(ip), s); }
+void march(vec2 p, vec2 dir, float len, out vec3 L, out vec3 T) {
+  L = vec3(0.0); T = vec3(1.0);
+  float t = 0.0; int ss = 0, steps = int(uRC.w);
+  for (int i = 0; i < 256; i++) {
+    if (any(lessThan(p, vec2(0.0))) || any(greaterThanEqual(p, uRes))) { T = vec3(0.0); return; }
+    ivec2 ip = ivec2(p);
+    float d = dist(ip);
+    if (d < 0.5) {
+      vec4 s = texelFetch(uScene, ip, 0);
+      if (s.a > 0.5) { L += T * s.rgb * fw(t); T = vec3(0.0); return; }
+      d = 1.0;
+    }
+    if (t + d >= len) break;
+    p += dir * d; t += d;
+    if (++ss >= steps) break;
+  }
+  T *= fw(len);
+}
+void main() {
+  vec2 res = vec2(textureSize(uUpper, 0));   // cascade テクスチャの解像度(配置の計算用)。画面の解像度は uRes
+  float N = uRC.x, count = uRC.y, I0 = uRC.z;
+  bool top = N >= count - 1.0;
+  vec2 coord = floor(gl_FragCoord.xy);
+  float s = exp2(N);
+  vec2 ext = floor(res / s);
+  vec2 probe = mod(coord, ext), blk = floor(coord / ext);
+  float p4 = pow(4.0, N);
+  float start = I0 * (p4 - 1.0) / 3.0;
+  float len = top ? 1e5 : I0 * p4;
+  vec2 origin = (probe + 0.5) * s;
+  float nRays = s * s * 4.0;
+  float base = (blk.x + blk.y * s) * 4.0;
+  float s1 = s * 2.0;
+  vec2 ext1 = floor(res / s1);
+  vec2 pu = probe * 0.5 - 0.25, q0 = floor(pu), wf = pu - q0;
+  vec3 acc = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    float idx = base + float(i);
+    float th = (idx + 0.5 + uRC2.w) * TAU / nRays;
+    vec2 d = vec2(cos(th), sin(th));
+    vec2 b1 = vec2(mod(idx, s1), floor(idx / s1)) * ext1;
+    vec3 L, T;
+    if (top) {
+      march(origin + d * start, d, len, L, T);
+    } else if (uRC2.z < 0.5 || N >= uFixMax) {
+      march(origin + d * start, d, len, L, T);
+      if (max(max(T.r, T.g), T.b) > 0.0) {
+        vec2 p1 = clamp(probe * 0.5 + 0.25, vec2(0.5), ext1 - 0.5);
+        L += T * texture(uUpper, (b1 + p1) / res).rgb;
+      }
+    } else {
+      L = vec3(0.0);
+      vec2 A = origin + d * start;
+      for (int k = 0; k < 4; k++) {
+        vec2 oo = vec2(float(k & 1), float(k >> 1));
+        vec2 q = clamp(q0 + oo, vec2(0.0), ext1 - 1.0);
+        float w = (oo.x > 0.5 ? wf.x : 1.0 - wf.x) * (oo.y > 0.5 ? wf.y : 1.0 - wf.y);
+        vec2 B = (q + 0.5) * s1 + d * (start + len);
+        vec2 dj = B - A; float Lj = length(dj); dj /= max(Lj, 1e-4);
+        vec3 Lk, Tk;
+        march(A, dj, Lj, Lk, Tk);
+        if (max(max(Tk.r, Tk.g), Tk.b) > 0.0) Lk += Tk * texelFetch(uUpper, ivec2(b1 + q), 0).rgb;
+        L += w * Lk;
+      }
+    }
+    acc += L * 0.25;
+  }
+  if (N < 0.5) {
+    if (any(greaterThanEqual(coord, uRes))) acc = vec3(0.0);
+    else { vec4 sc = texelFetch(uScene, ivec2(coord), 0); if (sc.a > 0.5) acc = sc.rgb; }
+  }
+  o = vec4(acc, 1.0);
+}`;
+
+const FS_ACCUM = HEAD + `
+uniform sampler2D uCur, uPrev, uScene; uniform float uAccum;
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  float a = texelFetch(uScene, ip, 0).a > 0.5 ? 0.0 : uAccum;
+  o = vec4(mix(texelFetch(uCur, ip, 0).rgb, texelFetch(uPrev, ip, 0).rgb, a), 1.0);
+}`;
+
+// 最大チャンネル Reinhard(色相も彩度も保つ)
+const FS_DISPLAY = HEAD + `
+uniform sampler2D uGI; uniform float uExposure;
+vec3 lin2srgb(vec3 c) { c = max(c, 0.0); return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+void main() {
+  vec3 g = texelFetch(uGI, ivec2(gl_FragCoord.xy), 0).rgb * uExposure;
+  g *= 1.0 / (1.0 + max(max(g.r, g.g), g.b));
+  o = vec4(lin2srgb(g), 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) + '\n' + src);
+  return s;
+}
+const vs = compile(gl.VERTEX_SHADER, VS);
+function program(fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name; u[name] = gl.getUniformLocation(p, name); }
+  return { p, u };
+}
+const P = {
+  paint: program(FS_PAINT), copy: program(FS_COPY), seed: program(FS_SEED), jfa: program(FS_JFA),
+  rc: program(FS_RC), accum: program(FS_ACCUM), display: program(FS_DISPLAY),
+};
+gl.bindVertexArray(gl.createVertexArray());
+
+// ---------- render targets ----------
+function target(w, h, linear) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+  const f = linear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { t, fb, w, h };
+}
+function free(r) { if (r) { gl.deleteTexture(r.t); gl.deleteFramebuffer(r.fb); } }
+function clearTarget(r) { gl.bindFramebuffer(gl.FRAMEBUFFER, r.fb); gl.viewport(0, 0, r.w, r.h); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+
+let W = 0, H = 0, CW = 0, CH = 0, jumps = [];
+let paint = null, jfaA = null, jfaB = null, casA = null, casB = null, accA = null, accB = null;
+let undo = [];
+
+function pass(prog, dst, tex, uniforms) {
+  gl.useProgram(prog.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+  gl.viewport(0, 0, dst ? dst.w : W, dst ? dst.h : H);
+  let unit = 0;
+  for (const k in tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex[k].t); gl.uniform1i(prog.u[k], unit++); }
+  for (const k in uniforms) {
+    const v = uniforms[k], loc = prog.u[k];
+    if (loc === undefined) continue;
+    if (typeof v === 'number') (k === 'uJump' ? gl.uniform1i : gl.uniform1f).call(gl, loc, v);
+    else if (v.length === 2) gl.uniform2fv(loc, v);
+    else if (v.length === 3) gl.uniform3fv(loc, v);
+    else gl.uniform4fv(loc, v);
+  }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function resize() {
+  const cw = innerWidth, ch = innerHeight;
+  const scale = Math.min(devicePixelRatio || 1, MAX_LONG / Math.max(cw, ch));
+  const w = Math.max(64, Math.round(cw * scale)), h = Math.max(64, Math.round(ch * scale));
+  if (w === W && h === H) return;
+  const old = paint;
+  W = w; H = h;
+  CW = Math.ceil(W / BLK) * BLK; CH = Math.ceil(H / BLK) * BLK;
+  canvas.width = W; canvas.height = H;
+  jumps = [1];
+  for (let j = 1 << Math.ceil(Math.log2(Math.max(W, H))) - 1; j >= 1; j >>= 1) jumps.push(j);
+  [jfaA, jfaB, casA, casB, accA, accB].forEach(free);
+  undo.forEach(free); undo = [];
+  paint = target(W, H, false);
+  clearTarget(paint);
+  if (old) { pass(P.copy, paint, { uSrc: old }, { uScale: [old.w / W, old.h / H] }); free(old); }
+  jfaA = target(W, H, false); jfaB = target(W, H, false);
+  casA = target(CW, CH, true); casB = target(CW, CH, true);
+  accA = target(W, H, false); accB = target(W, H, false);
+  clearTarget(accA); clearTarget(accB);
+}
+
+// ---------- state / UI ----------
+const state = { tool: 0, hue: 0.08, sat: 0.85, val: 1.0, size: 12 };
+const srgb2lin = c => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+function hsv2rgb(h, s, v) {
+  const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  return [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]][((i % 6) + 6) % 6];
+}
+const cssColor = () => { const [r, g, b] = hsv2rgb(state.hue, state.sat, state.val); return `rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})`; };
+const brushRGB = () => hsv2rgb(state.hue, state.sat, state.val).map(c => srgb2lin(c) * INTENSITY);
+const simScale = () => W / canvas.clientWidth;
+
+const segs = [];              // このフレームで塗る線分 [ax, ay, bx, by, mode]
+let stroke = null;            // { id, x, y }
+const cursor = document.getElementById('cursor');
+
+function toSim(e) {
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width * W, (1 - (e.clientY - r.top) / r.height) * H];
+}
+function pushUndo() {
+  flushPaint();   // 描きかけの線分を先に反映(Undo / Clear の後に前の線が残らないように)
+  const snap = target(W, H, false);
+  pass(P.copy, snap, { uSrc: paint }, { uScale: [1, 1] });
+  undo.push(snap);
+  if (undo.length > UNDO_MAX) free(undo.shift());
+}
+canvas.addEventListener('pointerdown', e => {
+  if (stroke) return;
+  closePicker();
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* 合成イベントなど、ポインタが無いとき */ }
+  pushUndo();
+  const [x, y] = toSim(e);
+  stroke = { id: e.pointerId, x, y };
+  segs.push([x, y, x, y, state.tool]);
+  hideHint();
+});
+canvas.addEventListener('pointermove', e => {
+  if (e.pointerType === 'mouse') {
+    const d = state.size;
+    cursor.style.display = 'block';
+    cursor.style.width = cursor.style.height = d * 2 + 'px';
+    cursor.style.left = e.clientX + 'px'; cursor.style.top = e.clientY + 'px';
+  }
+  if (!stroke || e.pointerId !== stroke.id) return;
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of (evs.length ? evs : [e])) {
+    const [x, y] = toSim(ev);
+    segs.push([stroke.x, stroke.y, x, y, state.tool]);
+    stroke.x = x; stroke.y = y;
+  }
+});
+const endStroke = e => { if (stroke && e.pointerId === stroke.id) stroke = null; };
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') cursor.style.display = 'none'; });
+
+const toolBtns = [...document.querySelectorAll('[data-tool]')];
+function setTool(t) { state.tool = t; toolBtns.forEach(b => b.classList.toggle('on', +b.dataset.tool === t)); }
+toolBtns.forEach(b => b.addEventListener('click', () => setTool(+b.dataset.tool)));
+function doUndo() { const s = undo.pop(); if (s) { pass(P.copy, paint, { uSrc: s }, { uScale: [1, 1] }); free(s); } }
+function doClear() { pushUndo(); clearTarget(paint); }
+function doSave() {
+  render();
+  canvas.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = '2d-gi-paint-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.png';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, 'image/png');
+}
+document.getElementById('undo').addEventListener('click', doUndo);
+document.getElementById('clear').addEventListener('click', doClear);
+document.getElementById('save').addEventListener('click', doSave);
+addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === '1' || k === '2' || k === '3') setTool(+k - 1);
+  else if (k === 'z') doUndo();
+  else if (k === 'c') doClear();
+  else if (k === 's') doSave();
+  else if (k === '[' || k === '-') setSize(state.size / 1.25);
+  else if (k === ']' || k === '=' || k === '+') setSize(state.size * 1.25);
+});
+
+// 色: 2 次元の面(横 = 色相、縦 = 明度。今の彩度で描く)+ 彩度バー。TD 版の HUD と同じ配置
+const picker = document.getElementById('picker'), hv = document.getElementById('hv'), sv = document.getElementById('sv');
+const swatch = document.querySelector('#swatch span');
+function drawPicker() {
+  const c = hv.getContext('2d'), img = c.createImageData(hv.width, hv.height);
+  for (let y = 0; y < hv.height; y++) for (let x = 0; x < hv.width; x++) {
+    const [r, g, b] = hsv2rgb(x / (hv.width - 1), state.sat, 1 - y / (hv.height - 1));
+    const i = (y * hv.width + x) * 4;
+    img.data[i] = r * 255; img.data[i + 1] = g * 255; img.data[i + 2] = b * 255; img.data[i + 3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+  const mx = state.hue * (hv.width - 1), my = (1 - state.val) * (hv.height - 1);
+  c.lineWidth = 2; c.strokeStyle = '#000'; c.beginPath(); c.arc(mx, my, 7, 0, 7); c.stroke();
+  c.strokeStyle = '#fff'; c.beginPath(); c.arc(mx, my, 5, 0, 7); c.stroke();
+  const s = sv.getContext('2d'), gr = s.createLinearGradient(0, 0, sv.width, 0);
+  const [r0, g0, b0] = hsv2rgb(state.hue, 0, state.val), [r1, g1, b1] = hsv2rgb(state.hue, 1, state.val);
+  gr.addColorStop(0, `rgb(${r0 * 255},${g0 * 255},${b0 * 255})`); gr.addColorStop(1, `rgb(${r1 * 255},${g1 * 255},${b1 * 255})`);
+  s.fillStyle = gr; s.fillRect(0, 0, sv.width, sv.height);
+  const sx = state.sat * (sv.width - 1);
+  s.fillStyle = '#000'; s.fillRect(sx - 3, 0, 6, sv.height); s.fillStyle = '#fff'; s.fillRect(sx - 1.5, 0, 3, sv.height);
+  swatch.style.background = cssColor();
+}
+function dragOn(el, fn) {
+  const go = e => { const r = el.getBoundingClientRect(); fn(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))); drawPicker(); };
+  el.addEventListener('pointerdown', e => { el.setPointerCapture(e.pointerId); go(e); if (state.tool === 1 || state.tool === 2) setTool(0); });
+  el.addEventListener('pointermove', e => { if (el.hasPointerCapture(e.pointerId)) go(e); });
+}
+dragOn(hv, (x, y) => { state.hue = x; state.val = 1 - y; });
+dragOn(sv, x => { state.sat = x; });
+
+// 太さ: くさび形のバー(左 = 細い、右 = 太い)。目盛りは対数で、細い側を細かく選べる。動かしている間は実寸の円を画面中央に出す
+const SIZE_MIN = 1.5, SIZE_MAX = 60;   // ブラシの半径(CSS px)
+const sizePop = document.getElementById('sizepop'), sz = document.getElementById('sz');
+const sizeDot = document.querySelector('#sizebtn span');
+const sizeT = () => Math.log(state.size / SIZE_MIN) / Math.log(SIZE_MAX / SIZE_MIN);
+function setSize(s) { state.size = Math.min(SIZE_MAX, Math.max(SIZE_MIN, s)); drawSize(); }
+function drawSize() {
+  const c = sz.getContext('2d'), w = sz.width, h = sz.height, x0 = 14, x1 = w - 14, cy = h / 2, t = sizeT();
+  const xt = x0 + (x1 - x0) * t, half = x => 1 + (x - x0) / (x1 - x0) * (h / 2 - 6);
+  c.clearRect(0, 0, w, h);
+  c.fillStyle = '#555';
+  c.beginPath(); c.moveTo(x0, cy - half(x0)); c.lineTo(x1, cy - half(x1)); c.lineTo(x1, cy + half(x1)); c.lineTo(x0, cy + half(x0)); c.fill();
+  c.fillStyle = '#e8e8e8';
+  c.beginPath(); c.moveTo(x0, cy - half(x0)); c.lineTo(xt, cy - half(xt)); c.lineTo(xt, cy + half(xt)); c.lineTo(x0, cy + half(x0)); c.fill();
+  c.lineWidth = 3; c.strokeStyle = '#000'; c.beginPath(); c.arc(xt, cy, 9, 0, 7); c.stroke();
+  c.lineWidth = 2; c.strokeStyle = '#fff'; c.beginPath(); c.arc(xt, cy, 9, 0, 7); c.stroke();
+  const d = Math.round(4 + 22 * t);
+  sizeDot.style.width = sizeDot.style.height = d + 'px';
+}
+function showPreview(on) {
+  if (!on) { cursor.style.display = 'none'; return; }
+  const r = canvas.getBoundingClientRect();
+  cursor.style.display = 'block';
+  cursor.style.width = cursor.style.height = state.size * 2 + 'px';
+  cursor.style.left = r.left + r.width / 2 + 'px'; cursor.style.top = r.top + r.height * 0.4 + 'px';
+}
+{
+  const go = e => {
+    const r = sz.getBoundingClientRect(), x0 = 14 / sz.width * r.width, x1 = r.width - x0;
+    const t = Math.min(1, Math.max(0, (e.clientX - r.left - x0) / (x1 - x0)));
+    setSize(SIZE_MIN * Math.pow(SIZE_MAX / SIZE_MIN, t));
+    showPreview(true);
+  };
+  sz.addEventListener('pointerdown', e => { try { sz.setPointerCapture(e.pointerId); } catch (_) {} go(e); });
+  sz.addEventListener('pointermove', e => { if (sz.hasPointerCapture(e.pointerId)) go(e); });
+  const end = () => showPreview(false);
+  sz.addEventListener('pointerup', end);
+  sz.addEventListener('pointercancel', end);
+}
+
+// 色と太さのパネルは同時に 1 つだけ開く。帯の段数で高さが変わるので、開くたびに帯の上に置く
+function openPop(pop) {
+  const open = !pop.classList.contains('open');
+  closePicker();
+  if (!open) return;
+  pop.style.bottom = innerHeight - document.getElementById('bar').getBoundingClientRect().top + 8 + 'px';
+  pop.classList.add('open');
+}
+function closePicker() { picker.classList.remove('open'); sizePop.classList.remove('open'); }
+document.getElementById('swatch').addEventListener('click', () => { openPop(picker); drawPicker(); });
+document.getElementById('sizebtn').addEventListener('click', () => { openPop(sizePop); drawSize(); });
+drawPicker();
+drawSize();
+
+const hint = document.getElementById('hint');
+function hideHint() { hint.style.opacity = 0; }
+
+// ---------- frame ----------
+let frame = 0;
+// ペイント(線分ごとに外接矩形だけ書く)
+function flushPaint() {
+  if (segs.length) {
+    gl.enable(gl.SCISSOR_TEST);
+    const rad = state.size * simScale(), col = brushRGB();
+    for (const [ax, ay, bx, by, mode] of segs) {
+      const x0 = Math.floor(Math.min(ax, bx) - rad - 1), y0 = Math.floor(Math.min(ay, by) - rad - 1);
+      gl.scissor(x0, y0, Math.ceil(Math.abs(bx - ax) + rad * 2 + 3), Math.ceil(Math.abs(by - ay) + rad * 2 + 3));
+      pass(P.paint, paint, {}, { uA: [ax, ay], uB: [bx, by], uR: rad, uMode: mode, uColor: col });
+    }
+    gl.disable(gl.SCISSOR_TEST);
+    segs.length = 0;
+  }
+}
+function render() {
+  // 1. ペイント → 2. seed → JFA
+  flushPaint();
+  pass(P.seed, jfaA, { uPaint: paint }, {});
+  for (const j of jumps) { pass(P.jfa, jfaB, { uPrev: jfaA }, { uJump: j }); [jfaA, jfaB] = [jfaB, jfaA]; }
+  // 3. Radiance Cascades(上位 → 下位)
+  const jitter = ((frame * 0.6180339887) % 1.0) - 0.5;
+  for (let n = NCASC - 1; n >= 0; n--) {
+    pass(P.rc, casB, { uScene: paint, uJfa: jfaA, uUpper: casA },
+      { uRC: [n, NCASC, I0, STEPS], uRC2: [0, FALLOFF, 1, jitter], uRes: [W, H], uFixMax: FIX_MAX });
+    [casA, casB] = [casB, casA];
+  }
+  // 4. 時間平均 → 5. 表示
+  pass(P.accum, accB, { uCur: casA, uPrev: accA, uScene: paint }, { uAccum: ACCUM });
+  [accA, accB] = [accB, accA];
+  pass(P.display, null, { uGI: accA }, { uExposure: EXPOSURE });
+  frame++;
+}
+function loop() { render(); requestAnimationFrame(loop); }
+
+resize();
+addEventListener('resize', resize);
+// 初期の絵: 中央に暖色の光を 1 つ置く(空だと真っ暗で何も起きないように見える)
+{
+  const r = Math.min(W, H) * 0.035;
+  segs.push([W * 0.5, H * 0.55, W * 0.5, H * 0.55, 0]);
+  const saved = state.size; state.size = r / simScale();
+  render();
+  state.size = saved;
+}
+loop();
+</script>
 </body>
 </html>
