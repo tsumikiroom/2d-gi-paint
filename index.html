@@ -26,16 +26,15 @@
   @media (max-width: 520px) {
     #bar { gap: 4px; padding: 5px; }
     #bar button { padding: 0 8px; font-size: 13px; }
-    #size { width: 80px; }
   }
   #bar button.on { background: var(--btn-on); color: var(--fg-on); }
-  #swatch { padding: 0; width: 44px; }
+  #bar #swatch, #bar #sizebtn { padding: 0; width: 44px; }
   #swatch span { display: block; width: 26px; height: 26px; margin: auto; border-radius: 50%; border: 2px solid #fff; }
-  #size { width: 96px; height: 44px; margin: 0; accent-color: #ddd; }
-  #picker { position: fixed; left: 8px; right: 8px; margin: 0 auto; width: fit-content; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 120px);
+  #sizebtn span { display: block; margin: auto; border-radius: 50%; background: #e8e8e8; }
+  .pop { position: fixed; left: 8px; right: 8px; margin: 0 auto; width: fit-content; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 120px);
     padding: 10px; border-radius: 14px; background: var(--bar-bg); display: none; touch-action: none; }
-  #picker.open { display: block; }
-  #picker canvas { display: block; border-radius: 8px; }
+  .pop.open { display: block; }
+  .pop canvas { display: block; border-radius: 8px; }
   #sv { margin-top: 8px; }
   #hint { position: fixed; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
     color: rgba(255,255,255,0.55); font-size: 13px; pointer-events: none; transition: opacity 0.6s; white-space: nowrap; }
@@ -46,16 +45,19 @@
 <canvas id="view"></canvas>
 <div id="cursor"></div>
 <div id="hint">Draw with light. Walls block it.</div>
-<div id="picker">
+<div id="picker" class="pop">
   <canvas id="hv" width="240" height="140"></canvas>
   <canvas id="sv" width="240" height="22"></canvas>
+</div>
+<div id="sizepop" class="pop">
+  <canvas id="sz" width="260" height="56"></canvas>
 </div>
 <div id="bar">
   <button data-tool="0" class="on" title="Light (1)">Light</button>
   <button data-tool="1" title="Wall (2)">Wall</button>
   <button data-tool="2" title="Erase (3)">Erase</button>
   <button id="swatch" title="Color"><span></span></button>
-  <input id="size" type="range" min="2" max="80" value="12" title="Brush size">
+  <button id="sizebtn" title="Brush size ([ ])"><span></span></button>
   <button id="undo" title="Undo (Z)">Undo</button>
   <button id="clear" title="Clear (C)">Clear</button>
   <button id="save" title="Save PNG (S)">Save</button>

@@ -314,8 +314,6 @@ canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') cu
 const toolBtns = [...document.querySelectorAll('[data-tool]')];
 function setTool(t) { state.tool = t; toolBtns.forEach(b => b.classList.toggle('on', +b.dataset.tool === t)); }
 toolBtns.forEach(b => b.addEventListener('click', () => setTool(+b.dataset.tool)));
-const sizeInput = document.getElementById('size');
-sizeInput.addEventListener('input', () => { state.size = +sizeInput.value; });
 function doUndo() { const s = undo.pop(); if (s) { pass(P.copy, paint, { uSrc: s }, { uScale: [1, 1] }); free(s); } }
 function doClear() { pushUndo(); clearTarget(paint); }
 function doSave() {
@@ -338,8 +336,8 @@ addEventListener('keydown', e => {
   else if (k === 'z') doUndo();
   else if (k === 'c') doClear();
   else if (k === 's') doSave();
-  else if (k === '[' || k === '-') { sizeInput.value = Math.max(2, state.size / 1.25); state.size = +sizeInput.value; }
-  else if (k === ']' || k === '=' || k === '+') { sizeInput.value = Math.min(80, state.size * 1.25); state.size = +sizeInput.value; }
+  else if (k === '[' || k === '-') setSize(state.size / 1.25);
+  else if (k === ']' || k === '=' || k === '+') setSize(state.size * 1.25);
 });
 
 // 色: 2 次元の面(横 = 色相、縦 = 明度。今の彩度で描く)+ 彩度バー。TD 版の HUD と同じ配置
@@ -371,12 +369,60 @@ function dragOn(el, fn) {
 }
 dragOn(hv, (x, y) => { state.hue = x; state.val = 1 - y; });
 dragOn(sv, x => { state.sat = x; });
-function closePicker() { picker.classList.remove('open'); }
-document.getElementById('swatch').addEventListener('click', () => {
-  picker.style.bottom = innerHeight - document.getElementById('bar').getBoundingClientRect().top + 8 + 'px';   // 帯の段数で高さが変わる
-  picker.classList.toggle('open'); drawPicker();
-});
+
+// 太さ: くさび形のバー(左 = 細い、右 = 太い)。目盛りは対数で、細い側を細かく選べる。動かしている間は実寸の円を画面中央に出す
+const SIZE_MIN = 1.5, SIZE_MAX = 60;   // ブラシの半径(CSS px)
+const sizePop = document.getElementById('sizepop'), sz = document.getElementById('sz');
+const sizeDot = document.querySelector('#sizebtn span');
+const sizeT = () => Math.log(state.size / SIZE_MIN) / Math.log(SIZE_MAX / SIZE_MIN);
+function setSize(s) { state.size = Math.min(SIZE_MAX, Math.max(SIZE_MIN, s)); drawSize(); }
+function drawSize() {
+  const c = sz.getContext('2d'), w = sz.width, h = sz.height, x0 = 14, x1 = w - 14, cy = h / 2, t = sizeT();
+  const xt = x0 + (x1 - x0) * t, half = x => 1 + (x - x0) / (x1 - x0) * (h / 2 - 6);
+  c.clearRect(0, 0, w, h);
+  c.fillStyle = '#555';
+  c.beginPath(); c.moveTo(x0, cy - half(x0)); c.lineTo(x1, cy - half(x1)); c.lineTo(x1, cy + half(x1)); c.lineTo(x0, cy + half(x0)); c.fill();
+  c.fillStyle = '#e8e8e8';
+  c.beginPath(); c.moveTo(x0, cy - half(x0)); c.lineTo(xt, cy - half(xt)); c.lineTo(xt, cy + half(xt)); c.lineTo(x0, cy + half(x0)); c.fill();
+  c.lineWidth = 3; c.strokeStyle = '#000'; c.beginPath(); c.arc(xt, cy, 9, 0, 7); c.stroke();
+  c.lineWidth = 2; c.strokeStyle = '#fff'; c.beginPath(); c.arc(xt, cy, 9, 0, 7); c.stroke();
+  const d = Math.round(4 + 22 * t);
+  sizeDot.style.width = sizeDot.style.height = d + 'px';
+}
+function showPreview(on) {
+  if (!on) { cursor.style.display = 'none'; return; }
+  const r = canvas.getBoundingClientRect();
+  cursor.style.display = 'block';
+  cursor.style.width = cursor.style.height = state.size * 2 + 'px';
+  cursor.style.left = r.left + r.width / 2 + 'px'; cursor.style.top = r.top + r.height * 0.4 + 'px';
+}
+{
+  const go = e => {
+    const r = sz.getBoundingClientRect(), x0 = 14 / sz.width * r.width, x1 = r.width - x0;
+    const t = Math.min(1, Math.max(0, (e.clientX - r.left - x0) / (x1 - x0)));
+    setSize(SIZE_MIN * Math.pow(SIZE_MAX / SIZE_MIN, t));
+    showPreview(true);
+  };
+  sz.addEventListener('pointerdown', e => { try { sz.setPointerCapture(e.pointerId); } catch (_) {} go(e); });
+  sz.addEventListener('pointermove', e => { if (sz.hasPointerCapture(e.pointerId)) go(e); });
+  const end = () => showPreview(false);
+  sz.addEventListener('pointerup', end);
+  sz.addEventListener('pointercancel', end);
+}
+
+// 色と太さのパネルは同時に 1 つだけ開く。帯の段数で高さが変わるので、開くたびに帯の上に置く
+function openPop(pop) {
+  const open = !pop.classList.contains('open');
+  closePicker();
+  if (!open) return;
+  pop.style.bottom = innerHeight - document.getElementById('bar').getBoundingClientRect().top + 8 + 'px';
+  pop.classList.add('open');
+}
+function closePicker() { picker.classList.remove('open'); sizePop.classList.remove('open'); }
+document.getElementById('swatch').addEventListener('click', () => { openPop(picker); drawPicker(); });
+document.getElementById('sizebtn').addEventListener('click', () => { openPop(sizePop); drawSize(); });
 drawPicker();
+drawSize();
 
 const hint = document.getElementById('hint');
 function hideHint() { hint.style.opacity = 0; }
