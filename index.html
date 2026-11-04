@@ -112,8 +112,11 @@ void main() {
 }`;
 
 const FS_COPY = HEAD + `
-uniform sampler2D uSrc; uniform vec2 uScale;   // uScale = src / dst(解像度が変わったときの引き伸ばし。補間なし)
-void main() { o = texelFetch(uSrc, ivec2(floor(gl_FragCoord.xy * uScale)), 0); }`;
+uniform sampler2D uSrc; uniform vec2 uScale, uOffset;   // src の座標 = dst の座標 × uScale + uOffset(補間なし。範囲外は空白)
+void main() {
+  ivec2 q = ivec2(floor(gl_FragCoord.xy * uScale + uOffset));
+  o = any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, textureSize(uSrc, 0))) ? vec4(0.0) : texelFetch(uSrc, q, 0);
+}`;
 
 // surface の画素に自分のピクセル座標(整数)を書く。空白は -1。half float で 2048 まで正確
 const FS_SEED = HEAD + `
@@ -299,13 +302,16 @@ function pass(prog, dst, tex, uniforms) {
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
+let SCALE = 0;   // シミュレーションの px / CSS px
 function resize() {
-  const cw = innerWidth, ch = innerHeight;
+  // キャンバスが実際に表示されている大きさで決める(iPad の Safari では innerHeight と 100dvh がずれて、絵が縦横に伸びた)
+  const r = canvas.getBoundingClientRect(), cw = r.width, ch = r.height;
+  if (cw < 1 || ch < 1) return;
   const scale = Math.min(devicePixelRatio || 1, MAX_LONG / Math.max(cw, ch));
   const w = Math.max(64, Math.round(cw * scale)), h = Math.max(64, Math.round(ch * scale));
   if (w === W && h === H) return;
-  const old = paint;
-  W = w; H = h;
+  const old = paint, oldScale = SCALE;
+  W = w; H = h; SCALE = scale;
   CW = Math.ceil(W / BLK) * BLK; CH = Math.ceil(H / BLK) * BLK;
   canvas.width = W; canvas.height = H;
   jumps = [1];
@@ -314,7 +320,16 @@ function resize() {
   undo.forEach(free); undo = [];
   paint = target(W, H, false);
   clearTarget(paint);
-  if (old) { pass(P.copy, paint, { uSrc: old }, { uScale: [old.w / W, old.h / H] }); free(old); }
+  if (old) {
+    // 回転などで縦横比が変わっても絵を伸ばさない: 縦横同じ倍率で、画面の中央どうしを合わせて写す(はみ出た分は切れる)
+    const k = oldScale / SCALE;
+    pass(P.copy, paint, { uSrc: old }, { uScale: [k, k], uOffset: [old.w / 2 - W / 2 * k, old.h / 2 - H / 2 * k] });
+    free(old);
+  } else {
+    // 初期の絵: 中央に暖色の光を 1 つ置く(空だと真っ暗で何も起きないように見える)
+    const x = W * 0.5, y = H * 0.55;
+    pass(P.paint, paint, {}, { uA: [x, y], uB: [x, y], uR: Math.min(W, H) * 0.035, uMode: 0, uColor: brushRGB() });
+  }
   jfaA = target(W, H, false); jfaB = target(W, H, false);
   casA = target(CW, CH, true); casB = target(CW, CH, true);
   accA = target(W, H, false); accB = target(W, H, false);
@@ -330,7 +345,7 @@ function hsv2rgb(h, s, v) {
 }
 const cssColor = () => { const [r, g, b] = hsv2rgb(state.hue, state.sat, state.val); return `rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})`; };
 const brushRGB = () => hsv2rgb(state.hue, state.sat, state.val).map(c => srgb2lin(c) * INTENSITY);
-const simScale = () => W / canvas.clientWidth;
+const simScale = () => SCALE;
 
 const segs = [];              // このフレームで塗る線分 [ax, ay, bx, by, mode]
 let stroke = null;            // { id, x, y }
@@ -341,9 +356,10 @@ function toSim(e) {
   return [(e.clientX - r.left) / r.width * W, (1 - (e.clientY - r.top) / r.height) * H];
 }
 function pushUndo() {
+  if (!paint) return;
   flushPaint();   // 描きかけの線分を先に反映(Undo / Clear の後に前の線が残らないように)
   const snap = target(W, H, false);
-  pass(P.copy, snap, { uSrc: paint }, { uScale: [1, 1] });
+  pass(P.copy, snap, { uSrc: paint }, { uScale: [1, 1], uOffset: [0, 0] });
   undo.push(snap);
   if (undo.length > UNDO_MAX) free(undo.shift());
 }
@@ -380,7 +396,7 @@ canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') cu
 const toolBtns = [...document.querySelectorAll('[data-tool]')];
 function setTool(t) { state.tool = t; toolBtns.forEach(b => b.classList.toggle('on', +b.dataset.tool === t)); }
 toolBtns.forEach(b => b.addEventListener('click', () => setTool(+b.dataset.tool)));
-function doUndo() { const s = undo.pop(); if (s) { pass(P.copy, paint, { uSrc: s }, { uScale: [1, 1] }); free(s); } }
+function doUndo() { const s = undo.pop(); if (s) { pass(P.copy, paint, { uSrc: s }, { uScale: [1, 1], uOffset: [0, 0] }); free(s); } }
 function doClear() { pushUndo(); clearTarget(paint); }
 function doSave() {
   render();
@@ -510,6 +526,7 @@ function flushPaint() {
   }
 }
 function render() {
+  if (!paint) return;   // キャンバスの大きさが 0 のうち(裏のタブなど)は、大きさが決まるまで待つ
   // 1. ペイント → 2. seed → JFA
   flushPaint();
   pass(P.seed, jfaA, { uPaint: paint }, {});
@@ -531,14 +548,7 @@ function loop() { render(); requestAnimationFrame(loop); }
 
 resize();
 addEventListener('resize', resize);
-// 初期の絵: 中央に暖色の光を 1 つ置く(空だと真っ暗で何も起きないように見える)
-{
-  const r = Math.min(W, H) * 0.035;
-  segs.push([W * 0.5, H * 0.55, W * 0.5, H * 0.55, 0]);
-  const saved = state.size; state.size = r / simScale();
-  render();
-  state.size = saved;
-}
+new ResizeObserver(resize).observe(canvas);   // ツールバーの出入りなど、ウィンドウの resize が来ない大きさの変化も拾う
 loop();
 </script>
 </body>
