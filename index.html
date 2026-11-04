@@ -58,6 +58,7 @@
   <button data-tool="2" title="Erase (3)">Erase</button>
   <button id="swatch" title="Color"><span></span></button>
   <button id="sizebtn" title="Brush size ([ ])"><span></span></button>
+  <button id="fogbtn" title="Fog (F)">Fog</button>
   <button id="undo" title="Undo (Z)">Undo</button>
   <button id="clear" title="Clear (C)">Clear</button>
   <button id="save" title="Save PNG (S)">Save</button>
@@ -83,6 +84,9 @@ const params = new URLSearchParams(location.search);
 // シミュレーション解像度の長辺の上限。JFA の座標を half float に入れるので 2048 まで
 const MAX_LONG = Math.min(2048, +params.get('res') || (touch ? 900 : 1400));
 const FIX_MAX = params.has('fix') ? +params.get('fix') : (touch ? 2 : 3);   // bilinear fix を使う段の数
+// 光の霧: FALLOFF で減る分の光のうち、この割合を空間が散らし直す(0 = 霧なし、1 未満)。F キーで入/切
+const FOG_DEFAULT = 0.6;
+let FOG = params.has('fog') ? Math.max(0, Math.min(0.95, +params.get('fog') || 0)) : FOG_DEFAULT;
 
 const canvas = document.getElementById('view');
 const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: false });
@@ -141,9 +145,9 @@ void main() {
 
 // Radiance Cascades 1 段(TD の rc.glsl から媒質・表裏バランスを除いたもの)
 const FS_RC = HEAD + `
-uniform sampler2D uScene, uJfa, uUpper;
+uniform sampler2D uScene, uJfa, uUpper, uFogSrc;
 uniform vec4 uRC;    // x = N, y = cascade 数, z = I0, w = 最大ステップ
-uniform vec4 uRC2;   // x = 未使用, y = Falloff, z = 1 なら bilinear fix, w = 角度ジッター
+uniform vec4 uRC2;   // x = 光の霧の散乱の割合, y = Falloff, z = 1 なら bilinear fix, w = 角度ジッター
 uniform vec2 uRes;   // 画面の解像度(cascade テクスチャは切り上げてある)
 uniform float uFixMax;
 #define TAU 6.28318530718
@@ -161,6 +165,10 @@ void march(vec2 p, vec2 dir, float len, out vec3 L, out vec3 T) {
       if (s.a > 0.5) { L += T * s.rgb * fw(t); T = vec3(0.0); return; }
       d = 1.0;
     }
+    float dd = min(d, len - t);
+    // 光の霧: 空白の区間で、前のフレームにそこへ届いていた光(全方向の平均)を散らし直して足す。
+    // 減衰 exp(-t / Falloff) を霧の濃さとみなすと、区間 dd で足す量 = 割合 × 光 × (1 - exp(-dd / Falloff))。区間の中点で光を読む
+    if (uRC2.x > 0.0 && uRC2.y > 0.0) L += T * fw(t) * uRC2.x * texelFetch(uFogSrc, clamp(ivec2(p + dir * (dd * 0.5)), ivec2(0), ivec2(uRes) - 1), 0).rgb * (1.0 - exp(-dd / uRC2.y));
     if (t + d >= len) break;
     p += dir * d; t += d;
     if (++ss >= steps) break;
@@ -408,6 +416,10 @@ function doSave() {
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }, 'image/png');
 }
+const fogBtn = document.getElementById('fogbtn');
+function toggleFog() { FOG = FOG > 0 ? 0 : FOG_DEFAULT; fogBtn.classList.toggle('on', FOG > 0); }
+fogBtn.classList.toggle('on', FOG > 0);
+fogBtn.addEventListener('click', toggleFog);
 document.getElementById('undo').addEventListener('click', doUndo);
 document.getElementById('clear').addEventListener('click', doClear);
 document.getElementById('save').addEventListener('click', doSave);
@@ -418,6 +430,7 @@ addEventListener('keydown', e => {
   else if (k === 'z') doUndo();
   else if (k === 'c') doClear();
   else if (k === 's') doSave();
+  else if (k === 'f') toggleFog();
   else if (k === '[' || k === '-') setSize(state.size / 1.25);
   else if (k === ']' || k === '=' || k === '+') setSize(state.size * 1.25);
 });
@@ -534,8 +547,8 @@ function render() {
   // 3. Radiance Cascades(上位 → 下位)
   const jitter = ((frame * 0.6180339887) % 1.0) - 0.5;
   for (let n = NCASC - 1; n >= 0; n--) {
-    pass(P.rc, casB, { uScene: paint, uJfa: jfaA, uUpper: casA },
-      { uRC: [n, NCASC, I0, STEPS], uRC2: [0, FALLOFF, 1, jitter], uRes: [W, H], uFixMax: FIX_MAX });
+    pass(P.rc, casB, { uScene: paint, uJfa: jfaA, uUpper: casA, uFogSrc: accA },
+      { uRC: [n, NCASC, I0, STEPS], uRC2: [FOG, FALLOFF, 1, jitter], uRes: [W, H], uFixMax: FIX_MAX });
     [casA, casB] = [casB, casA];
   }
   // 4. 時間平均 → 5. 表示
