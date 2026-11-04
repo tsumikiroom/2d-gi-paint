@@ -19,7 +19,7 @@
   #view { position: fixed; inset: 0; width: 100vw; height: 100dvh; display: block; touch-action: none; cursor: none; }
   #cursor { position: fixed; pointer-events: none; border: 1px solid rgba(255,255,255,0.7); border-radius: 50%;
     box-shadow: 0 0 0 1px rgba(0,0,0,0.6), 0 0 12px var(--glow); transform: translate(-50%, -50%); display: none; }
-  #bar, .pop { background: var(--panel); border: 1px solid var(--edge); border-radius: 20px; touch-action: none;
+  #bar { background: var(--panel); border: 1px solid var(--edge); border-radius: 20px; touch-action: none;
     backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 12px 40px rgba(0,0,0,0.55), 0 0 70px -24px var(--glow); }
   #bar { position: fixed; left: 8px; right: 8px; margin: 0 auto; width: fit-content; bottom: max(12px, env(safe-area-inset-bottom));
@@ -40,16 +40,12 @@
   #swatch span { display: block; width: 22px; height: 22px; margin: auto; border-radius: 50%;
     box-shadow: 0 0 0 2px rgba(255,255,255,0.22), 0 0 14px 2px var(--glow); }
   #sizebtn span { display: block; margin: auto; border-radius: 50%; background: #fff; box-shadow: 0 0 10px 1px var(--glow); }
-  .pop { position: fixed; left: 8px; right: 8px; margin: 0 auto; width: fit-content; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 120px);
-    padding: 12px; display: none; }
-  .pop.open { display: block; }
-  .pop canvas { display: block; border-radius: 10px; }
-  #sv { margin-top: 8px; }
+  #gest { position: fixed; inset: 0; width: 100vw; height: 100dvh; pointer-events: none; display: none; }
   #hint { position: fixed; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
     color: rgba(232,236,255,0.55); font-size: 13px; letter-spacing: 0.06em; text-shadow: 0 0 12px var(--glow);
     pointer-events: none; transition: opacity 0.6s; white-space: nowrap; }
   /* UI を隠す(H キー / Hide)。隠している間は右下の小さな光の点だけ残し、押すと戻る */
-  body.noui #bar, body.noui .pop.open, body.noui #hint { display: none; }
+  body.noui #bar, body.noui #hint { display: none; }
   #showbtn { position: fixed; right: max(10px, env(safe-area-inset-right)); bottom: max(10px, env(safe-area-inset-bottom));
     width: 44px; height: 44px; border: 0; border-radius: 50%; background: transparent; display: none; opacity: 0.45; touch-action: none; }
   #showbtn::after { content: ""; display: block; width: 8px; height: 8px; margin: auto; border-radius: 50%;
@@ -62,20 +58,14 @@
 <canvas id="view"></canvas>
 <div id="cursor"></div>
 <div id="hint">Draw with light. Walls block it.</div>
-<div id="picker" class="pop">
-  <canvas id="hv" width="240" height="140"></canvas>
-  <canvas id="sv" width="240" height="22"></canvas>
-</div>
-<div id="sizepop" class="pop">
-  <canvas id="sz" width="260" height="56"></canvas>
-</div>
+<canvas id="gest"></canvas>
 <div id="bar">
   <button data-tool="0" class="on" title="Light (1)">Light</button>
   <button data-tool="1" title="Wall (2)">Wall</button>
   <button data-tool="2" title="Erase (3)">Erase</button>
   <i class="sep"></i>
-  <button id="swatch" title="Color"><span></span></button>
-  <button id="sizebtn" title="Brush size ([ ])"><span></span></button>
+  <button id="swatch" title="Color: drag up for hue, then left / right for brightness"><span></span></button>
+  <button id="sizebtn" title="Brush size: drag up ([ ])"><span></span></button>
   <i class="sep"></i>
   <button id="fogbtn" title="Fog (F)">Fog</button>
   <button id="undo" title="Undo (Z)">Undo</button>
@@ -366,14 +356,15 @@ function resize() {
 }
 
 // ---------- state / UI ----------
-const state = { tool: 0, hue: 0.08, sat: 0.85, val: 1.0, size: 12 };
+const SAT = 0.85;   // 彩度は固定(白だけは色相の帯の上端で選べる)
+const state = { tool: 0, hue: 0.08, sat: SAT, val: 1.0, boost: 1.0, size: 12 };   // boost: 明度 1 を超えた分(光を強くする)
 const srgb2lin = c => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
 function hsv2rgb(h, s, v) {
   const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
   return [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]][((i % 6) + 6) % 6];
 }
 const cssColor = () => { const [r, g, b] = hsv2rgb(state.hue, state.sat, state.val); return `rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})`; };
-const brushRGB = () => hsv2rgb(state.hue, state.sat, state.val).map(c => srgb2lin(c) * INTENSITY);
+const brushRGB = () => hsv2rgb(state.hue, state.sat, state.val).map(c => srgb2lin(c) * INTENSITY * state.boost);
 const simScale = () => SCALE;
 
 const segs = [];              // このフレームで塗る線分 [ax, ay, bx, by, mode]
@@ -394,7 +385,6 @@ function pushUndo() {
 }
 canvas.addEventListener('pointerdown', e => {
   if (stroke) return;
-  closePicker();
   try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* 合成イベントなど、ポインタが無いとき */ }
   pushUndo();
   const [x, y] = toSim(e);
@@ -441,7 +431,7 @@ const fogBtn = document.getElementById('fogbtn');
 function toggleFog() { FOG = FOG > 0 ? 0 : FOG_DEFAULT; fogBtn.classList.toggle('on', FOG > 0); }
 fogBtn.classList.toggle('on', FOG > 0);
 fogBtn.addEventListener('click', toggleFog);
-function setUI(on) { closePicker(); document.body.classList.toggle('noui', !on); }
+function setUI(on) { document.body.classList.toggle('noui', !on); }
 document.getElementById('hidebtn').addEventListener('click', () => setUI(false));
 document.getElementById('showbtn').addEventListener('click', () => setUI(true));
 document.getElementById('undo').addEventListener('click', doUndo);
@@ -460,91 +450,97 @@ addEventListener('keydown', e => {
   else if (k === ']' || k === '=' || k === '+') setSize(state.size * 1.25);
 });
 
-// 色: 2 次元の面(横 = 色相、縦 = 明度。今の彩度で描く)+ 彩度バー。TD 版の HUD と同じ配置
-const picker = document.getElementById('picker'), hv = document.getElementById('hv'), sv = document.getElementById('sv');
-const swatch = document.querySelector('#swatch span');
-function drawPicker() {
-  const c = hv.getContext('2d'), img = c.createImageData(hv.width, hv.height);
-  for (let y = 0; y < hv.height; y++) for (let x = 0; x < hv.width; x++) {
-    const [r, g, b] = hsv2rgb(x / (hv.width - 1), state.sat, 1 - y / (hv.height - 1));
-    const i = (y * hv.width + x) * 4;
-    img.data[i] = r * 255; img.data[i + 1] = g * 255; img.data[i + 2] = b * 255; img.data[i + 3] = 255;
-  }
-  c.putImageData(img, 0, 0);
-  const mx = state.hue * (hv.width - 1), my = (1 - state.val) * (hv.height - 1);
-  c.lineWidth = 2; c.strokeStyle = '#000'; c.beginPath(); c.arc(mx, my, 7, 0, 7); c.stroke();
-  c.strokeStyle = '#fff'; c.beginPath(); c.arc(mx, my, 5, 0, 7); c.stroke();
-  const s = sv.getContext('2d'), gr = s.createLinearGradient(0, 0, sv.width, 0);
-  const [r0, g0, b0] = hsv2rgb(state.hue, 0, state.val), [r1, g1, b1] = hsv2rgb(state.hue, 1, state.val);
-  gr.addColorStop(0, `rgb(${r0 * 255},${g0 * 255},${b0 * 255})`); gr.addColorStop(1, `rgb(${r1 * 255},${g1 * 255},${b1 * 255})`);
-  s.fillStyle = gr; s.fillRect(0, 0, sv.width, sv.height);
-  const sx = state.sat * (sv.width - 1);
-  s.fillStyle = '#000'; s.fillRect(sx - 3, 0, 6, sv.height); s.fillStyle = '#fff'; s.fillRect(sx - 1.5, 0, 3, sv.height);
+// 色と太さはボタンから 1 回のドラッグで決める。押している間だけ画面に案内(#gest)を描く
+//  太さ: 上に引いた距離 = 太さ(毎回いちばん細いところから)
+//  色:   上に引いた距離 = 色相(上端は白)、左右 = 明度(左で暗く、右で 1 を超えて強く)
+const SIZE_MIN = 1.5, SIZE_MAX = 60;   // ブラシの半径(CSS px)
+const SIZE_LEN = 240, HUE_LEN = 260, WHITE = 0.9;   // 引く長さ px。色相の帯の上 10% は白
+const BRIGHT_PX = 45, BRIGHT_MIN = 0.08, BRIGHT_MAX = 3;   // 明度は 45px で 2 倍
+const swatch = document.querySelector('#swatch span'), sizeDot = document.querySelector('#sizebtn span');
+const gest = document.getElementById('gest');
+const sizeT = () => Math.log(state.size / SIZE_MIN) / Math.log(SIZE_MAX / SIZE_MIN);
+function updateUI() {
   swatch.style.background = cssColor();
   document.documentElement.style.setProperty('--glow', cssColor());   // UI の光も筆の色にする
-  drawSize();
-}
-function dragOn(el, fn) {
-  const go = e => { const r = el.getBoundingClientRect(); fn(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))); drawPicker(); };
-  el.addEventListener('pointerdown', e => { el.setPointerCapture(e.pointerId); go(e); if (state.tool === 1 || state.tool === 2) setTool(0); });
-  el.addEventListener('pointermove', e => { if (el.hasPointerCapture(e.pointerId)) go(e); });
-}
-dragOn(hv, (x, y) => { state.hue = x; state.val = 1 - y; });
-dragOn(sv, x => { state.sat = x; });
-
-// 太さ: くさび形のバー(左 = 細い、右 = 太い)。目盛りは対数で、細い側を細かく選べる。動かしている間は実寸の円を画面中央に出す
-const SIZE_MIN = 1.5, SIZE_MAX = 60;   // ブラシの半径(CSS px)
-const sizePop = document.getElementById('sizepop'), sz = document.getElementById('sz');
-const sizeDot = document.querySelector('#sizebtn span');
-const sizeT = () => Math.log(state.size / SIZE_MIN) / Math.log(SIZE_MAX / SIZE_MIN);
-function setSize(s) { state.size = Math.min(SIZE_MAX, Math.max(SIZE_MIN, s)); drawSize(); }
-function drawSize() {
-  const c = sz.getContext('2d'), w = sz.width, h = sz.height, x0 = 14, x1 = w - 14, cy = h / 2, t = sizeT();
-  const xt = x0 + (x1 - x0) * t, half = x => 1 + (x - x0) / (x1 - x0) * (h / 2 - 6);
-  c.clearRect(0, 0, w, h);
-  c.fillStyle = 'rgba(255,255,255,0.12)';
-  c.beginPath(); c.moveTo(x0, cy - half(x0)); c.lineTo(x1, cy - half(x1)); c.lineTo(x1, cy + half(x1)); c.lineTo(x0, cy + half(x0)); c.fill();
-  c.save(); c.fillStyle = '#fff'; c.shadowColor = cssColor(); c.shadowBlur = 12;
-  c.beginPath(); c.moveTo(x0, cy - half(x0)); c.lineTo(xt, cy - half(xt)); c.lineTo(xt, cy + half(xt)); c.lineTo(x0, cy + half(x0)); c.fill();
-  c.restore();
-  c.lineWidth = 3; c.strokeStyle = '#000'; c.beginPath(); c.arc(xt, cy, 9, 0, 7); c.stroke();
-  c.lineWidth = 2; c.strokeStyle = '#fff'; c.beginPath(); c.arc(xt, cy, 9, 0, 7); c.stroke();
-  const d = Math.round(4 + 22 * t);
+  const d = Math.round(4 + 22 * sizeT());
   sizeDot.style.width = sizeDot.style.height = d + 'px';
 }
-function showPreview(on) {
-  if (!on) { cursor.style.display = 'none'; return; }
-  const r = canvas.getBoundingClientRect();
-  cursor.style.display = 'block';
-  cursor.style.width = cursor.style.height = state.size * 2 + 'px';
-  cursor.style.left = r.left + r.width / 2 + 'px'; cursor.style.top = r.top + r.height * 0.4 + 'px';
-}
-{
-  const go = e => {
-    const r = sz.getBoundingClientRect(), x0 = 14 / sz.width * r.width, x1 = r.width - x0;
-    const t = Math.min(1, Math.max(0, (e.clientX - r.left - x0) / (x1 - x0)));
-    setSize(SIZE_MIN * Math.pow(SIZE_MAX / SIZE_MIN, t));
-    showPreview(true);
-  };
-  sz.addEventListener('pointerdown', e => { try { sz.setPointerCapture(e.pointerId); } catch (_) {} go(e); });
-  sz.addEventListener('pointermove', e => { if (sz.hasPointerCapture(e.pointerId)) go(e); });
-  const end = () => showPreview(false);
-  sz.addEventListener('pointerup', end);
-  sz.addEventListener('pointercancel', end);
-}
+function setSize(s) { state.size = Math.min(SIZE_MAX, Math.max(SIZE_MIN, s)); updateUI(); }
+const rgbStr = (h, s, v) => { const [r, g, b] = hsv2rgb(h, s, v); return `rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})`; };
 
-// 色と太さのパネルは同時に 1 つだけ開く。帯の段数で高さが変わるので、開くたびに帯の上に置く
-function openPop(pop) {
-  const open = !pop.classList.contains('open');
-  closePicker();
-  if (!open) return;
-  pop.style.bottom = innerHeight - document.getElementById('bar').getBoundingClientRect().top + 8 + 'px';
-  pop.classList.add('open');
+let drag = null;   // { kind, id, x0, y0, x, y, len, moved }
+function drawGest() {
+  const dpr = devicePixelRatio || 1, c = gest.getContext('2d');
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, innerWidth, innerHeight);
+  const { x0, y0, x, y, len } = drag, top = y0 - len;
+  c.lineCap = 'round';
+  if (drag.kind === 'size') {
+    // くさび(下 = 細い、上 = 太い)。指の高さまで光らせる
+    const half = yy => 1.5 + (y0 - yy) / len * 11, yt = Math.min(y0, Math.max(top, y));
+    c.fillStyle = 'rgba(255,255,255,0.14)';
+    c.beginPath(); c.moveTo(x0 - half(y0), y0); c.lineTo(x0 - half(top), top); c.lineTo(x0 + half(top), top); c.lineTo(x0 + half(y0), y0); c.fill();
+    c.save(); c.fillStyle = '#fff'; c.shadowColor = cssColor(); c.shadowBlur = 14;
+    c.beginPath(); c.moveTo(x0 - half(y0), y0); c.lineTo(x0 - half(yt), yt); c.lineTo(x0 + half(yt), yt); c.lineTo(x0 + half(y0), y0); c.fill();
+    c.restore();
+    // 実寸の輪を指のまわりに
+    c.lineWidth = 3; c.strokeStyle = 'rgba(0,0,0,0.6)'; c.beginPath(); c.arc(x, y, state.size, 0, 7); c.stroke();
+    c.save(); c.lineWidth = 1.5; c.strokeStyle = '#fff'; c.shadowColor = cssColor(); c.shadowBlur = 10;
+    c.beginPath(); c.arc(x, y, state.size, 0, 7); c.stroke(); c.restore();
+  } else {
+    // 色相の縦帯(上端は白)
+    const g = c.createLinearGradient(0, y0, 0, top);
+    for (let i = 0; i <= 12; i++) g.addColorStop(i / 12 * WHITE, rgbStr(i / 12, SAT, 1));
+    g.addColorStop(WHITE + 0.01, '#fff'); g.addColorStop(1, '#fff');
+    c.save(); c.shadowColor = cssColor(); c.shadowBlur = 16; c.lineWidth = 12; c.strokeStyle = g;
+    c.beginPath(); c.moveTo(x0, y0); c.lineTo(x0, top); c.stroke(); c.restore();
+    if (drag.moved) {
+      // 明度の横帯(指の高さ、押した位置が明度 1)
+      const xl = x0 - Math.log2(1 / BRIGHT_MIN) * BRIGHT_PX, xr = x0 + Math.log2(BRIGHT_MAX) * BRIGHT_PX;
+      const h = state.hue, s = state.sat, gb = c.createLinearGradient(xl, 0, xr, 0);
+      gb.addColorStop(0, '#000'); gb.addColorStop((x0 - xl) / (xr - xl), rgbStr(h, s, 1)); gb.addColorStop(1, rgbStr(h, s * 0.35, 1));
+      c.lineWidth = 10; c.strokeStyle = gb; c.beginPath(); c.moveTo(xl, y); c.lineTo(xr, y); c.stroke();
+      c.fillStyle = 'rgba(255,255,255,0.8)'; c.fillRect(x0 - 1, y - 9, 2, 18);   // 明度 1 の目印
+      // 選んでいる色の玉(指で隠れないよう上に出す)
+      const r = 16 + 4 * Math.min(1, state.boost - 1);
+      c.save(); c.fillStyle = cssColor(); c.shadowColor = cssColor(); c.shadowBlur = 18 * state.boost;
+      c.beginPath(); c.arc(x, y - 58, r, 0, 7); c.fill(); c.restore();
+      c.lineWidth = 2; c.strokeStyle = 'rgba(255,255,255,0.85)'; c.beginPath(); c.arc(x, y - 58, r, 0, 7); c.stroke();
+    }
+  }
 }
-function closePicker() { picker.classList.remove('open'); sizePop.classList.remove('open'); }
-document.getElementById('swatch').addEventListener('click', () => { openPop(picker); drawPicker(); });
-document.getElementById('sizebtn').addEventListener('click', () => { openPop(sizePop); drawSize(); });
-drawPicker();   // 太さのバーも中で描く
+function gestMove(e) {
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (!drag.moved && Math.hypot(drag.x - drag.x0, drag.y - drag.y0) < 6) return drawGest();   // タップだけなら何も変えない
+  drag.moved = true;
+  const u = Math.min(1, Math.max(0, (drag.y0 - drag.y) / drag.len));
+  if (drag.kind === 'size') setSize(SIZE_MIN * Math.pow(SIZE_MAX / SIZE_MIN, u));
+  else {
+    if (u > WHITE) state.sat = 0; else { state.sat = SAT; state.hue = u / WHITE; }
+    const b = Math.min(BRIGHT_MAX, Math.max(BRIGHT_MIN, Math.pow(2, (drag.x - drag.x0) / BRIGHT_PX)));
+    state.val = Math.min(1, b); state.boost = Math.max(1, b);
+    if (state.tool === 1 || state.tool === 2) setTool(0);   // 色を選んだら光の筆に戻す
+    updateUI();
+  }
+  drawGest();
+}
+for (const [id, kind, LEN] of [['swatch', 'color', HUE_LEN], ['sizebtn', 'size', SIZE_LEN]]) {
+  const btn = document.getElementById(id);
+  btn.addEventListener('pointerdown', e => {
+    if (drag) return;
+    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+    const dpr = devicePixelRatio || 1;
+    gest.width = innerWidth * dpr; gest.height = innerHeight * dpr; gest.style.display = 'block';
+    drag = { kind, id: e.pointerId, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, len: Math.max(80, Math.min(LEN, e.clientY - 30)), moved: false };
+    drawGest();
+  });
+  btn.addEventListener('pointermove', e => { if (drag && e.pointerId === drag.id) gestMove(e); });
+  const end = e => { if (drag && e.pointerId === drag.id) { drag = null; gest.style.display = 'none'; } };
+  btn.addEventListener('pointerup', end);
+  btn.addEventListener('pointercancel', end);
+  btn.addEventListener('lostpointercapture', end);
+}
+updateUI();
 
 const hint = document.getElementById('hint');
 function hideHint() { hint.style.opacity = 0; }
