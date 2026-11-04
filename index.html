@@ -344,11 +344,7 @@ function resize() {
     const k = oldScale / SCALE;
     pass(P.copy, paint, { uSrc: old }, { uScale: [k, k], uOffset: [old.w / 2 - W / 2 * k, old.h / 2 - H / 2 * k] });
     free(old);
-  } else {
-    // 初期の絵: 中央に暖色の光を 1 つ置く(空だと真っ暗で何も起きないように見える)
-    const x = W * 0.5, y = H * 0.55;
-    pass(P.paint, paint, {}, { uA: [x, y], uB: [x, y], uR: Math.min(W, H) * 0.035, uMode: 0, uColor: brushRGB() });
-  }
+  }   // 最初は真っ黒。触ったところから光がつく
   jfaA = target(W, H, false); jfaB = target(W, H, false);
   casA = target(CW, CH, true); casB = target(CW, CH, true);
   accA = target(W, H, false); accB = target(W, H, false);
